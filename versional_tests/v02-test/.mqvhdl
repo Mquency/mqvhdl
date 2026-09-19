@@ -1,0 +1,2 @@
+source_dir=rtl
+testbench_dir=verification
