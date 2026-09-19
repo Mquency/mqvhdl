@@ -1,0 +1,13 @@
+# GHDL build artifacts
+*.cf
+
+# Waveforms
+*.ghw
+*.vcd
+
+# GTKWave
+*.gtkw
+
+# Temporary files
+*.tmp
+*.log

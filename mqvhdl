@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+
+set -e
+
+# ============================================================
+# mqvhdl - A small VHDL build and simulation runner
+# ============================================================
+
+VERSION="0.1.0"
+
+# ------------------------------------------------------------
+# Colors
+# ------------------------------------------------------------
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+RESET='\033[0m'
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+info() {
+    echo -e "${BLUE}→${RESET} $1"
+}
+
+success() {
+    echo -e "${GREEN}✓${RESET} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}!${RESET} $1"
+}
+
+error() {
+    echo -e "${RED}✗${RESET} $1"
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+
+mqvhdl ${VERSION}
+
+Usage:
+    mqvhdl <command> [options]
+
+Commands:
+    build       Analyze and elaborate VHDL
+    run         Run a testbench simulation
+    clean       Remove generated files
+    help        Show this help message
+
+Build options:
+    -s, --source <file>     VHDL source file
+    -t, --tb <file>         Testbench file
+    -a, --analyze           Analyze only
+    -e, --elaborate         Elaborate the design
+
+Run options:
+    -t, --tb <file>         Testbench file
+    -o, --output <name>     GHW waveform name
+    -g, --ghw               Generate GHW waveform
+    --no-wave               Do not generate a waveform
+
+Examples:
+    mqvhdl build -s src/and_gate.vhd
+    mqvhdl build -s src/and_gate.vhd -t tb/and_gate_tb.vhd
+    mqvhdl build -s src/and_gate.vhd -a
+    mqvhdl build -s src/and_gate.vhd -e
+
+    mqvhdl run -t tb/and_gate_tb.vhd
+    mqvhdl run -t tb/and_gate_tb.vhd -g
+    mqvhdl run -t tb/and_gate_tb.vhd -o and_gate
+
+    mqvhdl clean
+
+EOF
+}
+
+# ------------------------------------------------------------
+# Dependency checks
+# ------------------------------------------------------------
+
+check_dependencies() {
+    command -v ghdl >/dev/null 2>&1 \
+        || error "GHDL is not installed."
+
+    command -v gtkwave >/dev/null 2>&1 \
+        || warn "GTKWave is not installed. Waveforms cannot be opened."
+}
+
+# ------------------------------------------------------------
+# Build
+# ------------------------------------------------------------
+
+build() {
+
+    local source=""
+    local tb=""
+    local analyze_only=false
+    local elaborate=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+
+            -s|--source)
+                [[ -n "$2" ]] || error "Missing value for $1"
+                source="$2"
+                shift 2
+                ;;
+
+            -t|--tb)
+                [[ -n "$2" ]] || error "Missing value for $1"
+                tb="$2"
+                shift 2
+                ;;
+
+            -a|--analyze)
+                analyze_only=true
+                shift
+                ;;
+
+            -e|--elaborate)
+                elaborate=true
+                shift
+                ;;
+
+            -h|--help)
+                usage
+                exit 0
+                ;;
+
+            *)
+                error "Unknown build option: $1"
+                ;;
+
+        esac
+    done
+
+    [[ -n "$source" ]] \
+        || error "No source file specified. Use -s <file>."
+
+    [[ -f "$source" ]] \
+        || error "Source file not found: $source"
+
+    check_dependencies
+
+    echo
+    echo -e "${CYAN}mqvhdl build${RESET}"
+    echo
+
+    info "Analyzing: $source"
+
+    ghdl -a "$source"
+
+    success "Source analyzed"
+
+    if [[ -n "$tb" ]]; then
+
+        [[ -f "$tb" ]] \
+            || error "Testbench file not found: $tb"
+
+        info "Analyzing testbench: $tb"
+
+        ghdl -a "$tb"
+
+        success "Testbench analyzed"
+    fi
+
+    if [[ "$analyze_only" == true ]]; then
+        echo
+        success "Analysis complete"
+        exit 0
+    fi
+
+    if [[ "$elaborate" == true || -n "$tb" ]]; then
+
+        if [[ -z "$tb" ]]; then
+            error "Elaboration requires a testbench with -t <file>."
+        fi
+
+        local tb_name
+        tb_name="$(basename "$tb" .vhd)"
+
+        info "Elaborating: $tb_name"
+
+        ghdl -e "$tb_name"
+
+        success "Elaboration complete"
+    fi
+
+    echo
+    success "Build complete"
+}
+
+# ------------------------------------------------------------
+# Run
+# ------------------------------------------------------------
+
+run_simulation() {
+
+    local tb=""
+    local output=""
+    local generate_ghw=false
+    local no_wave=false
+
+    while [[ $# -gt 0 ]]; do
+
+        case "$1" in
+
+            -t|--tb)
+                [[ -n "$2" ]] || error "Missing value for $1"
+                tb="$2"
+                shift 2
+                ;;
+
+            -o|--output)
+                [[ -n "$2" ]] || error "Missing value for $1"
+                output="$2"
+                shift 2
+                ;;
+
+            -g|--ghw)
+                generate_ghw=true
+                shift
+                ;;
+
+            --no-wave)
+                no_wave=true
+                shift
+                ;;
+
+            -h|--help)
+                usage
+                exit 0
+                ;;
+
+            *)
+                error "Unknown run option: $1"
+                ;;
+
+        esac
+
+    done
+
+    [[ -n "$tb" ]] \
+        || error "No testbench specified. Use -t <file>."
+
+    [[ -f "$tb" ]] \
+        || error "Testbench file not found: $tb"
+
+    check_dependencies
+
+    local tb_name
+    tb_name="$(basename "$tb" .vhd)"
+
+    echo
+    echo -e "${CYAN}mqvhdl run${RESET}"
+    echo
+
+    # --------------------------------------------------------
+    # Analyze
+    # --------------------------------------------------------
+
+    info "Analyzing testbench: $tb"
+
+    ghdl -a "$tb"
+
+    success "Testbench analyzed"
+
+    # --------------------------------------------------------
+    # Elaborate
+    # --------------------------------------------------------
+
+    info "Elaborating: $tb_name"
+
+    ghdl -e "$tb_name"
+
+    success "Elaboration complete"
+
+    # --------------------------------------------------------
+    # Run
+    # --------------------------------------------------------
+
+    if [[ "$no_wave" == true ]]; then
+
+        info "Running simulation"
+
+        ghdl -r "$tb_name"
+
+    else
+
+        generate_ghw=true
+
+        if [[ -z "$output" ]]; then
+            output="$tb_name"
+        fi
+
+        local ghw_file="${output}.ghw"
+
+        info "Running simulation"
+        info "Waveform: $ghw_file"
+
+        ghdl -r "$tb_name" --wave="$ghw_file"
+
+        success "Waveform generated: $ghw_file"
+    fi
+
+    echo
+    success "Simulation complete"
+
+    # --------------------------------------------------------
+    # Open GTKWave
+    # --------------------------------------------------------
+
+    if [[ "$generate_ghw" == true && "$no_wave" == false ]]; then
+
+        if command -v gtkwave >/dev/null 2>&1; then
+
+            info "Opening GTKWave"
+
+            gtkwave "${output}.ghw" >/dev/null 2>&1 &
+
+            success "GTKWave started"
+
+        else
+
+            warn "GTKWave is not installed."
+        fi
+
+    fi
+}
+
+# ------------------------------------------------------------
+# Clean
+# ------------------------------------------------------------
+
+clean() {
+
+    info "Cleaning generated GHDL files..."
+
+    rm -f *.cf
+    rm -f *.ghw
+    rm -f *.vcd
+
+    success "Clean complete"
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+case "${1:-}" in
+
+    build)
+        shift
+        build "$@"
+        ;;
+
+    run)
+        shift
+        run_simulation "$@"
+        ;;
+
+    clean)
+        clean
+        ;;
+
+    help|-h|--help)
+        usage
+        ;;
+
+    --version|-v)
+        echo "mqvhdl ${VERSION}"
+        ;;
+
+    "")
+        usage
+        ;;
+
+    *)
+        error "Unknown command: $1. Use 'mqvhdl help'."
+        ;;
+
+esac
