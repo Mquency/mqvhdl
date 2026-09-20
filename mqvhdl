@@ -1,134 +1,905 @@
 #!/usr/bin/env bash
+#
+# mqvhdl — a lightweight VHDL project workflow tool built around GHDL and GTKWave
+#
+# Author   : mquency
+# Version  : 0.3.0
+# License  : MIT
+#
+# v0.3.0:
+#   * dependency-ordered builds (entity/package/component graph)
+#   * minimal build scope: only what the selected testbench(es) need
+#   * content-hash cache that also invalidates on GHDL version or
+#     analysis-option changes (e.g. std)
+#   * build/ output tree (waveforms, elaborated binaries)
+#   * mqvhdl.lock — generated lock file of the last successful build
+#   * richer .mqvhdl configuration (std, ieee, relaxed, fexplicit)
+#   * interactive testbench menu, colorful output, command timing
 
 set -e
 
-VERSION="0.2.0"
+VERSION="0.3.0"
+
 CONFIG_FILE=".mqvhdl"
+LOCK_FILE="mqvhdl.lock"
+
+CACHE_DIR=".mqvhdl_modules"
+CACHE_META="$CACHE_DIR/meta"
+CACHE_GHDL="$CACHE_DIR/ghdl"
+CACHE_INDEX="$CACHE_META/index"
+CACHE_GHDLVER="$CACHE_META/ghdl.version"
+CACHE_LOCK="$CACHE_DIR/lock"
+
+BUILD_DIR="build"
+BUILD_BIN="$BUILD_DIR/bin"
+BUILD_WAVE="$BUILD_DIR/wave"
+
+VALID_STD="87 93 00 02 08 19"
+VALID_IEEE="standard synopsys none"
 
 # ─────────────────────────────────────────────
-# Colors
+# Colors (disabled on non-tty / NO_COLOR)
 # ─────────────────────────────────────────────
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-RESET='\033[0m'
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+  BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+else
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; BOLD=""; DIM=""; RESET=""
+fi
 
-info() {
-    echo -e "${BLUE}→${RESET} $1"
-}
+info()    { printf '%s\n' "${BLUE}→${RESET} $*"; }
+success() { printf '%s\n' "${GREEN}✓${RESET} $*"; }
+warn()    { printf '%s\n' "${YELLOW}!${RESET} $*" >&2; }
+error()   { printf '%s\n' "${RED}✗${RESET} $*" >&2; }
+hint()    { printf '%s\n' "${DIM}  $*${RESET}" >&2; }
+dim()     { printf '%s\n' "${DIM}  • $*${RESET}"; }
 
-success() {
-    echo -e "${GREEN}✓${RESET} $1"
-}
-
-warn() {
-    echo -e "${YELLOW}!${RESET} $1"
-}
-
-error() {
-    echo -e "${RED}✗${RESET} $1" >&2
+header() {
+  printf '\n%s%s%s\n' "$CYAN$BOLD" "$1" "$RESET"
+  printf '%s%s%s\n' "$DIM" "────────────────────────────────────────" "$RESET"
 }
 
 # ─────────────────────────────────────────────
 # General helpers
 # ─────────────────────────────────────────────
 
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
+command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 require_command() {
-    if ! command_exists "$1"; then
-        error "Required command not found: $1"
-        exit 1
+  if ! command_exists "$1"; then
+    error "Required command not found: $1"
+    exit 1
+  fi
+}
+
+require_bash() {
+  if (( BASH_VERSINFO[0] < 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2 ) )); then
+    error "mqvhdl requires bash >= 4.2 (found: $BASH_VERSION)"
+    exit 1
+  fi
+}
+
+setup_hash() {
+  if command_exists sha256sum; then
+    HASH_TOOL="sha256sum"
+  elif command_exists shasum; then
+    HASH_TOOL="shasum"
+  else
+    error "Neither 'sha256sum' nor 'shasum' found (needed for the cache)."
+    exit 1
+  fi
+}
+
+hash_file() {
+  case "$HASH_TOOL" in
+    sha256sum) sha256sum "$1" | cut -d' ' -f1 ;;
+    shasum)    shasum -a 256 "$1" | cut -d' ' -f1 ;;
+  esac
+}
+
+hash_stdin() {
+  case "$HASH_TOOL" in
+    sha256sum) sha256sum | cut -d' ' -f1 ;;
+    shasum)    shasum -a 256 | cut -d' ' -f1 ;;
+  esac
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# ─────────────────────────────────────────────
+# Timing  (the "completed in 1.87s" line)
+# ─────────────────────────────────────────────
+
+TIMER_START_NS=0
+TIMER_ENABLED=0
+COMMAND_NAME=""
+
+now_ns() {
+  local t=""
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local r="$EPOCHREALTIME"      # seconds.microseconds (bash >= 5)
+    t="${r/./}000"                # → nanoseconds
+  else
+    t="$(date +%s%N 2>/dev/null)"
+  fi
+  if [[ ! "$t" =~ ^[0-9]+$ ]]; then
+    t=$(( ${SECONDS:-0} * 1000000000 ))
+  fi
+  printf '%s\n' "$t"
+}
+
+fmt_duration() {
+  LC_ALL=C awk -v ns="$1" 'BEGIN {
+    if      (ns >= 1000000000) printf "%.2fs", ns / 1000000000
+    else if (ns >= 1000000)    printf "%dms",  ns / 1000000
+    else if (ns >= 1000)       printf "%dµs", ns / 1000
+    else                       printf "%dns",  ns
+  }'
+}
+
+start_timer() {
+  TIMER_START_NS="$(now_ns)"
+  TIMER_ENABLED=1
+}
+
+finish_timer() {
+  local code="$1"
+  if (( TIMER_ENABLED == 0 )); then return 0; fi
+  local end diff t
+  end="$(now_ns)"
+  diff=$(( end - TIMER_START_NS ))
+  if (( diff < 0 )); then diff=0; fi
+  t="$(fmt_duration "$diff")"
+  if (( code == 0 )); then
+    printf '%s\n' "${GREEN}✓${RESET} ${BOLD}${COMMAND_NAME}${RESET} completed in ${BOLD}${t}${RESET}"
+  else
+    printf '%s\n' "${RED}✗${RESET} ${BOLD}${COMMAND_NAME}${RESET} failed in ${BOLD}${t}${RESET}" >&2
+    case "$COMMAND_NAME" in
+      build|run) hint "Fix the errors reported above and try again." ;;
+    esac
+  fi
+}
+
+# ─────────────────────────────────────────────
+# Instance lock (guards the GHDL library)
+# ─────────────────────────────────────────────
+
+INSTANCE_LOCKED=0
+
+acquire_instance_lock() {
+  mkdir -p "$CACHE_DIR"
+  if [[ -f "$CACHE_LOCK" ]]; then
+    local pid
+    pid="$(cat "$CACHE_LOCK" 2>/dev/null || true)"
+    if [[ -n "$pid" && "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null; then
+      error "Another mqvhdl instance is running (pid $pid)."
+      hint "If this is wrong, remove '$CACHE_LOCK' and retry."
+      exit 1
     fi
+    rm -f "$CACHE_LOCK"
+  fi
+  printf '%s\n' "$$" > "$CACHE_LOCK"
+  INSTANCE_LOCKED=1
+}
+
+release_instance_lock() {
+  if (( INSTANCE_LOCKED )); then
+    rm -f "$CACHE_LOCK"
+    INSTANCE_LOCKED=0
+  fi
+}
+
+# ─────────────────────────────────────────────
+# Project configuration (.mqvhdl)
+# ─────────────────────────────────────────────
+
+std_display() {
+  case "$1" in
+    87) printf 'VHDL-87' ;;
+    93) printf 'VHDL-93' ;;
+    00) printf 'VHDL-2000' ;;
+    02) printf 'VHDL-2002' ;;
+    08) printf 'VHDL-2008' ;;
+    19) printf 'VHDL-2019' ;;
+    *)  printf '%s' "$1" ;;
+  esac
+}
+
+load_config() {
+  SOURCE_DIR="src"
+  TESTBENCH_DIR="tb"
+  STD="93"
+  IEEE="standard"
+  RELAXED="no"
+  FEXPLICIT="no"
+
+  local line key value lineno=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    line="${line%%#*}"                # strip comments
+    line="$(trim "$line")"
+    if [[ -z "$line" ]]; then continue; fi
+    if [[ "$line" != *=* ]]; then
+      warn "$CONFIG_FILE line $lineno: not 'key=value' — ignored"
+      continue
+    fi
+    key="$(trim "${line%%=*}")"
+    value="$(trim "${line#*=}")"
+    case "$key" in
+      source_dir)    SOURCE_DIR="$value" ;;
+      testbench_dir) TESTBENCH_DIR="$value" ;;
+      std)           STD="$value" ;;
+      ieee)          IEEE="$value" ;;
+      relaxed)       RELAXED="$value" ;;
+      fexplicit)     FEXPLICIT="$value" ;;
+      *)             warn "$CONFIG_FILE line $lineno: unknown key '$key' — ignored" ;;
+    esac
+  done < "$CONFIG_FILE"
+
+  if [[ -z "$SOURCE_DIR" || -z "$TESTBENCH_DIR" ]]; then
+    error "$CONFIG_FILE: source_dir and testbench_dir must not be empty."
+    exit 1
+  fi
+  if [[ " $VALID_STD " != *" $STD "* ]]; then
+    error "$CONFIG_FILE: invalid std '$STD'."
+    hint "Valid values: $VALID_STD"
+    exit 1
+  fi
+  if [[ " $VALID_IEEE " != *" $IEEE "* ]]; then
+    error "$CONFIG_FILE: invalid ieee '$IEEE'."
+    hint "Valid values: $VALID_IEEE"
+    exit 1
+  fi
+  if [[ "$RELAXED" != "yes" && "$RELAXED" != "no" ]]; then
+    error "$CONFIG_FILE: relaxed must be 'yes' or 'no'."
+    exit 1
+  fi
+  if [[ "$FEXPLICIT" != "yes" && "$FEXPLICIT" != "no" ]]; then
+    error "$CONFIG_FILE: fexplicit must be 'yes' or 'no'."
+    exit 1
+  fi
 }
 
 require_project() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        error "No $CONFIG_FILE found."
-        echo
-        echo "Run 'mqvhdl init' first."
-        exit 1
+  local dir="$PWD"
+  while :; do
+    if [[ -f "$dir/$CONFIG_FILE" ]]; then
+      if [[ "$dir" != "$PWD" ]]; then
+        cd "$dir"
+        info "Project root: $dir"
+      fi
+      return 0
     fi
-}
-
-get_config_value() {
-    local key="$1"
-
-    grep "^${key}=" "$CONFIG_FILE" | head -n 1 | cut -d '=' -f 2-
+    if [[ "$dir" == "/" ]]; then break; fi
+    dir="$(dirname "$dir")"
+  done
+  error "No $CONFIG_FILE found in '$PWD' or any parent directory."
+  hint "Run 'mqvhdl init' to create a project."
+  exit 1
 }
 
 # ─────────────────────────────────────────────
-# Project configuration
+# GHDL environment
 # ─────────────────────────────────────────────
 
-load_config() {
-    SOURCE_DIR="$(get_config_value "source_dir")"
-    TESTBENCH_DIR="$(get_config_value "testbench_dir")"
+GHDL_VERSION="unknown"
+GHDL_FLAGS=()
 
-    if [[ -z "$SOURCE_DIR" || -z "$TESTBENCH_DIR" ]]; then
-        error "Invalid $CONFIG_FILE"
-        echo
-        echo "Expected:"
-        echo "  source_dir=src"
-        echo "  testbench_dir=tb"
-        exit 1
+detect_ghdl_version() {
+  GHDL_VERSION="$(ghdl --version 2>/dev/null | head -n 1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  if [[ -z "$GHDL_VERSION" ]]; then GHDL_VERSION="unknown"; fi
+}
+
+build_ghdl_flags() {
+  GHDL_FLAGS=(--std="$STD" --workdir="$CACHE_GHDL")
+  if [[ "$IEEE" != "standard" ]]; then
+    GHDL_FLAGS+=(--ieee="$IEEE")
+  fi
+  if [[ "$RELAXED" == "yes" ]]; then
+    GHDL_FLAGS+=(--relaxed-rules)
+  fi
+  if [[ "$FEXPLICIT" == "yes" ]]; then
+    GHDL_FLAGS+=(-fexplicit)
+  fi
+}
+
+flags_signature() {
+  # Everything that changes the meaning of an analysis result.
+  printf 'std=%s;ieee=%s;relaxed=%s;fexplicit=%s;ghdl=%s;mqvhdl=%s' \
+    "$STD" "$IEEE" "$RELAXED" "$FEXPLICIT" "$GHDL_VERSION" "$VERSION"
+}
+
+prepare_build_env() {
+  mkdir -p "$CACHE_META" "$CACHE_GHDL"
+  detect_ghdl_version
+  local prev=""
+  if [[ -f "$CACHE_GHDLVER" ]]; then
+    prev="$(sed -n '1p' "$CACHE_GHDLVER")"
+  fi
+  if [[ -n "$prev" && "$prev" != "$GHDL_VERSION" ]]; then
+    warn "GHDL changed ('$prev' → '$GHDL_VERSION') — resetting the GHDL library cache."
+    rm -rf "$CACHE_GHDL"
+    mkdir -p "$CACHE_GHDL"
+  fi
+  printf '%s\n' "$GHDL_VERSION" > "$CACHE_GHDLVER"
+}
+
+# ─────────────────────────────────────────────
+# VHDL parsing (regex-based, comments stripped,
+# names normalized to lowercase — VHDL is
+# case-insensitive)
+# ─────────────────────────────────────────────
+
+# Reserved words that must never be treated as an instantiated unit
+KW_BLACKLIST="process block assert generate postponed case if for while default
+others when entity component configuration attribute file disconnect use library
+context begin end then loop wait report next exit null return"
+KW_NAME_EXTRA="in out inout buffer linkage open is"
+
+read_stripped() {
+  sed -E 's/--.*$//' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# Echoes declaration tokens: "kind:name" separated by spaces.
+# kinds: entity, package, pkgbody, config, context, arch (arch:<entity>)
+get_defs() {
+  local stripped
+  stripped="$(read_stripped "$1")"
+  local tokens=""
+  local n
+
+  while IFS= read -r n; do
+    if [[ -n "$n" ]]; then tokens+="entity:$n "; fi
+  done < <(sed -nE 's/^[[:space:]]*entity[[:space:]]+([a-z][a-z0-9_]*)[[:space:]]+is([[:space:]].*)?$/\1/p' <<<"$stripped")
+
+  while IFS= read -r n; do
+    if [[ -n "$n" ]]; then tokens+="pkgbody:$n "; fi
+  done < <(sed -nE 's/^[[:space:]]*package[[:space:]]+body[[:space:]]+([a-z][a-z0-9_]*)[[:space:]]+is([[:space:]].*)?$/\1/p' <<<"$stripped")
+
+  while IFS= read -r n; do
+    if [[ -n "$n" ]]; then tokens+="package:$n "; fi
+  done < <(sed -nE 's/^[[:space:]]*package[[:space:]]+([a-z][a-z0-9_]*)[[:space:]]+is([[:space:]].*)?$/\1/p' <<<"$stripped")
+
+  while IFS= read -r n; do
+    if [[ -n "$n" ]]; then tokens+="config:$n "; fi
+  done < <(sed -nE 's/^[[:space:]]*configuration[[:space:]]+([a-z][a-z0-9_]*)[[:space:]]+of([[:space:]].*)?$/\1/p' <<<"$stripped")
+
+  while IFS= read -r n; do
+    if [[ -n "$n" ]]; then tokens+="context:$n "; fi
+  done < <(sed -nE 's/^[[:space:]]*context[[:space:]]+([a-z][a-z0-9_]*)[[:space:]]+is([[:space:]].*)?$/\1/p' <<<"$stripped")
+
+  while IFS= read -r n; do
+    if [[ -n "$n" ]]; then tokens+="arch:$n "; fi
+  done < <(sed -nE 's/^[[:space:]]*architecture[[:space:]]+[a-z][a-z0-9_]*[[:space:]]+of[[:space:]]+([a-z][a-z0-9_]*)[[:space:]]+is([[:space:]].*)?$/\1/p' <<<"$stripped")
+
+  printf '%s' "$tokens"
+}
+
+declare -A ENT_FILE PKG_FILE PKGBODY_FILE CFG_FILE CTX_FILE FILE_DEFS ARCH_MAP UNRES_WARNED
+
+register_defs() {
+  local file="$1" tokens="$2"
+  FILE_DEFS["$file"]="$tokens"
+  local token kind name existing
+  for token in $tokens; do
+    kind="${token%%:*}"
+    name="${token#*:}"
+    case "$kind" in
+      entity)
+        existing="${ENT_FILE[$name]:-}"
+        if [[ -z "$existing" ]]; then ENT_FILE["$name"]="$file"
+        elif [[ "$existing" != "$file" ]]; then warn "entity '$name' redefined in $file (first seen: $existing)"; fi
+        ;;
+      package)
+        existing="${PKG_FILE[$name]:-}"
+        if [[ -z "$existing" ]]; then PKG_FILE["$name"]="$file"
+        elif [[ "$existing" != "$file" ]]; then warn "package '$name' redefined in $file (first seen: $existing)"; fi
+        ;;
+      pkgbody)
+        existing="${PKGBODY_FILE[$name]:-}"
+        if [[ -z "$existing" ]]; then PKGBODY_FILE["$name"]="$file"
+        elif [[ "$existing" != "$file" ]]; then warn "package body '$name' redefined in $file (first seen: $existing)"; fi
+        ;;
+      config)
+        existing="${CFG_FILE[$name]:-}"
+        if [[ -z "$existing" ]]; then CFG_FILE["$name"]="$file"
+        elif [[ "$existing" != "$file" ]]; then warn "configuration '$name' redefined in $file (first seen: $existing)"; fi
+        ;;
+      context)
+        existing="${CTX_FILE[$name]:-}"
+        if [[ -z "$existing" ]]; then CTX_FILE["$name"]="$file"
+        elif [[ "$existing" != "$file" ]]; then warn "context '$name' redefined in $file (first seen: $existing)"; fi
+        ;;
+      arch)
+        ARCH_MAP["$name"]+="$file"$'\n'
+        ;;
+    esac
+  done
+}
+
+warn_unresolved() {
+  local key="$1|$2"
+  if [[ -z "${UNRES_WARNED[$key]:-}" ]]; then
+    UNRES_WARNED["$key"]=1
+    warn "unresolved reference to $2 in $1 — skipping"
+  fi
+}
+
+# Echoes the resolved dependency files of $1 (newline separated, sorted, unique).
+get_refs() {
+  local file="$1"
+  local stripped
+  stripped="$(read_stripped "$file")"
+  local -A seen=()
+  local -a deps=()
+  local n f f2 t kind name label changed
+
+  add_resolved() {
+    if [[ -n "$1" && "$1" != "$file" && -z "${seen[$1]:-}" ]]; then
+      seen["$1"]=1
+      deps+=("$1")
     fi
+  }
+
+  # use work.<pkg>[.all]
+  while IFS= read -r n; do
+    if [[ -z "$n" || "$n" == "all" ]]; then continue; fi
+    add_resolved "${PKG_FILE[$n]:-}"
+    if [[ -z "${PKG_FILE[$n]:-}" ]]; then warn_unresolved "$file" "package 'work.$n'"; fi
+  done < <(grep -oE 'use[[:space:]]+work\.[a-z][a-z0-9_]*' <<<"$stripped" | sed -E 's/^use[[:space:]]+work\.//')
+
+  # context work.<ctx>
+  while IFS= read -r n; do
+    if [[ -z "$n" ]]; then continue; fi
+    add_resolved "${CTX_FILE[$n]:-}"
+    if [[ -z "${CTX_FILE[$n]:-}" ]]; then warn_unresolved "$file" "context 'work.$n'"; fi
+  done < <(grep -oE 'context[[:space:]]+work\.[a-z][a-z0-9_]*' <<<"$stripped" | sed -E 's/^context[[:space:]]+work\.//')
+
+  # direct entity instantiation / configuration binding: entity work.<ent>
+  while IFS= read -r n; do
+    if [[ -z "$n" ]]; then continue; fi
+    add_resolved "${ENT_FILE[$n]:-}"
+    if [[ -z "${ENT_FILE[$n]:-}" ]]; then warn_unresolved "$file" "entity 'work.$n'"; fi
+  done < <(grep -oE 'entity[[:space:]]+work\.[a-z][a-z0-9_]*' <<<"$stripped" | sed -E 's/^entity[[:space:]]+work\.//')
+
+  # package instantiation: ... new work.<pkg>
+  while IFS= read -r n; do
+    if [[ -z "$n" ]]; then continue; fi
+    add_resolved "${PKG_FILE[$n]:-}"
+    if [[ -z "${PKG_FILE[$n]:-}" ]]; then warn_unresolved "$file" "package 'work.$n' (package instantiation)"; fi
+  done < <(grep -oE 'new[[:space:]]+work\.[a-z][a-z0-9_]*' <<<"$stripped" | sed -E 's/^new[[:space:]]+work\.//')
+
+  # configuration <c> of <entity>
+  while IFS= read -r n; do
+    if [[ -z "$n" ]]; then continue; fi
+    add_resolved "${ENT_FILE[$n]:-}"
+    if [[ -z "${ENT_FILE[$n]:-}" ]]; then warn_unresolved "$file" "entity 'work.$n' (bound by configuration)"; fi
+  done < <(sed -nE 's/^[[:space:]]*configuration[[:space:]]+[a-z][a-z0-9_]*[[:space:]]+of[[:space:]]+([a-z][a-z0-9_]*).*/\1/p' <<<"$stripped")
+
+  # declarations in this file that require other files to be analyzed first
+  for t in ${FILE_DEFS[$file]}; do
+    kind="${t%%:*}"; name="${t#*:}"
+    case "$kind" in
+      pkgbody)
+        add_resolved "${PKG_FILE[$name]:-}"
+        if [[ -z "${PKG_FILE[$name]:-}" ]]; then warn_unresolved "$file" "package '$name' (body without declaration in project)"; fi
+        ;;
+      arch)
+        add_resolved "${ENT_FILE[$name]:-}"
+        if [[ -z "${ENT_FILE[$name]:-}" ]]; then warn_unresolved "$file" "entity '$name' (architecture without entity in project)"; fi
+        ;;
+    esac
+  done
+
+  # label : name  →  component/entity/configuration instantiation
+  # (default binding: component <name> binds to entity work.<name>)
+  while IFS='|' read -r label name; do
+    if [[ -z "$name" ]]; then continue; fi
+    if [[ " $KW_BLACKLIST $KW_NAME_EXTRA " == *" $name "* ]]; then continue; fi
+    if [[ " $KW_BLACKLIST " == *" $label "* ]]; then continue; fi
+    f="${ENT_FILE[$name]:-}"
+    if [[ -z "$f" ]]; then f="${CFG_FILE[$name]:-}"; fi
+    add_resolved "$f"    # unresolved names are silently ignored here
+  done < <(grep -E '^[[:space:]]*[a-z][a-z0-9_]*[[:space:]]*:[[:space:]]*[a-z][a-z0-9_]*' <<<"$stripped" \
+           | sed -nE 's/^[[:space:]]*([a-z][a-z0-9_]*)[[:space:]]*:[[:space:]]*([a-z][a-z0-9_]*).*/\1|\2/p')
+
+  # Structural completion (iterated to a fixpoint):
+  #   * every entity in the closure pulls in the files holding its architectures
+  #   * every package in the closure pulls in its package body
+  seen["$file"]=1
+  changed=1
+  while (( changed )); do
+    changed=0
+    while IFS= read -r f; do
+      if [[ -z "$f" ]]; then continue; fi
+      for t in ${FILE_DEFS[$f]}; do
+        kind="${t%%:*}"; name="${t#*:}"
+        case "$kind" in
+          entity)
+            while IFS= read -r f2; do
+              if [[ -n "$f2" && -z "${seen[$f2]:-}" ]]; then
+                seen["$f2"]=1; deps+=("$f2"); changed=1
+              fi
+            done <<<"${ARCH_MAP[$name]:-}"
+            ;;
+          package)
+            f2="${PKGBODY_FILE[$name]:-}"
+            if [[ -n "$f2" && -z "${seen[$f2]:-}" ]]; then
+              seen["$f2"]=1; deps+=("$f2"); changed=1
+            fi
+            ;;
+        esac
+      done
+    done < <(printf '%s\n' "${!seen[@]}" | LC_ALL=C sort)
+  done
+
+  if (( ${#deps[@]} > 0 )); then
+    printf '%s\n' "${deps[@]}" | LC_ALL=C sort -u
+  fi
 }
 
 # ─────────────────────────────────────────────
-# Entity discovery
+# Dependency graph (DFS, cycle detection)
 # ─────────────────────────────────────────────
 
-discover_entities() {
-    local directory="$1"
+declare -A NODE_STATE CLOSURE_DEPS
+declare -a DFS_STACK=() POST_ORDER=()
 
-    [[ -d "$directory" ]] || return 0
-
-    while IFS= read -r -d '' file; do
-        grep -Eio '^[[:space:]]*entity[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*' "$file" \
-            | sed -E 's/^[[:space:]]*entity[[:space:]]+//I' \
-            | while IFS= read -r entity; do
-                echo "$entity|$file"
-            done
-    done < <(find "$directory" -type f \( -iname "*.vhd" -o -iname "*.vhdl" \) -print0 | sort -z)
+reset_graph() {
+  unset NODE_STATE CLOSURE_DEPS
+  declare -gA NODE_STATE CLOSURE_DEPS
+  DFS_STACK=()
+  POST_ORDER=()
 }
 
-find_entity_file() {
-    local requested_entity="$1"
-    local directory="$2"
+visit_file() {
+  local file="$1"
+  local st="${NODE_STATE[$file]:-0}"
+  if (( st == 2 )); then return 0; fi
+  if (( st == 1 )); then
+    error "Circular dependency detected:"
+    local f started=0
+    for f in "${DFS_STACK[@]}"; do
+      if [[ "$f" == "$file" ]]; then started=1; fi
+      if (( started )); then hint "→ $f"; fi
+    done
+    hint "→ $file"
+    exit 1
+  fi
+  NODE_STATE["$file"]=1
+  DFS_STACK+=("$file")
+  local deps
+  deps="$(get_refs "$file")"
+  CLOSURE_DEPS["$file"]="$deps"
+  local dep
+  while IFS= read -r dep; do
+    if [[ -z "$dep" ]]; then continue; fi
+    visit_file "$dep"
+  done <<<"$deps"
+  local last=$(( ${#DFS_STACK[@]} - 1 ))
+  unset "DFS_STACK[$last]"
+  NODE_STATE["$file"]=2
+  POST_ORDER+=("$file")     # post-order == dependencies first
+}
 
-    local requested_lower
-    requested_lower="$(echo "$requested_entity" | tr '[:upper:]' '[:lower:]')"
+declare -a SOURCE_FILES=() TB_FILES=() FILES_COLLECTED=()
+TB_ENTITIES=()
 
-    while IFS='|' read -r entity file; do
-        local entity_lower
-        entity_lower="$(echo "$entity" | tr '[:upper:]' '[:lower:]')"
+collect_vhdl_files() {
+  FILES_COLLECTED=()
+  if [[ ! -d "$1" ]]; then return 0; fi
+  local f
+  while IFS= read -r -d '' f; do
+    FILES_COLLECTED+=("$f")
+  done < <(find "$1" -type f \( -iname '*.vhd' -o -iname '*.vhdl' \) -print0 | LC_ALL=C sort -z)
+}
 
-        if [[ "$entity_lower" == "$requested_lower" ]]; then
-            echo "$file"
-            return 0
-        fi
-    done < <(discover_entities "$directory")
+scan_project() {
+  collect_vhdl_files "$SOURCE_DIR"
+  SOURCE_FILES=("${FILES_COLLECTED[@]}")
+  collect_vhdl_files "$TESTBENCH_DIR"
+  TB_FILES=("${FILES_COLLECTED[@]}")
+  local f
+  for f in "${SOURCE_FILES[@]}"; do
+    register_defs "$f" "$(get_defs "$f")"
+  done
+  for f in "${TB_FILES[@]}"; do
+    register_defs "$f" "$(get_defs "$f")"
+  done
+}
 
-    return 1
+collect_tb_entities() {
+  TB_ENTITIES=()
+  local f t
+  for f in "${TB_FILES[@]}"; do
+    for t in ${FILE_DEFS[$f]:-}; do
+      case "$t" in
+        entity:*) TB_ENTITIES+=("${t#entity:}") ;;
+      esac
+    done
+  done
+  if (( ${#TB_ENTITIES[@]} > 0 )); then
+    mapfile -t TB_ENTITIES < <(printf '%s\n' "${TB_ENTITIES[@]}" | LC_ALL=C sort -u)
+  fi
 }
 
 # ─────────────────────────────────────────────
-# Dependency checks
+# Testbench selection (flag / auto / menu)
 # ─────────────────────────────────────────────
 
-check_build_dependencies() {
-    require_command ghdl
+SELECTED_TB=""
+
+select_testbench() {
+  local requested="${1:-}"
+  SELECTED_TB=""
+
+  if [[ -n "$requested" ]]; then
+    local want
+    want="$(printf '%s' "$requested" | tr '[:upper:]' '[:lower:]')"
+    local tb
+    for tb in "${TB_ENTITIES[@]}"; do
+      if [[ "$tb" == "$want" ]]; then SELECTED_TB="$tb"; break; fi
+    done
+    if [[ -z "$SELECTED_TB" ]]; then
+      error "Testbench not found: $requested"
+      if (( ${#TB_ENTITIES[@]} > 0 )); then
+        hint "Available testbenches:"
+        for tb in "${TB_ENTITIES[@]}"; do hint "• $tb"; done
+      else
+        hint "No testbench entities found in $TESTBENCH_DIR/."
+      fi
+      exit 1
+    fi
+    return 0
+  fi
+
+  if (( ${#TB_ENTITIES[@]} == 0 )); then
+    error "No testbench entities found in $TESTBENCH_DIR/."
+    exit 1
+  fi
+
+  if (( ${#TB_ENTITIES[@]} == 1 )); then
+    SELECTED_TB="${TB_ENTITIES[0]}"
+    info "Single testbench found, using: ${BOLD}$SELECTED_TB${RESET}"
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    error "Multiple testbenches found — specify one with --tb."
+    local tb
+    for tb in "${TB_ENTITIES[@]}"; do hint "• $tb"; done
+    exit 1
+  fi
+
+  echo
+  warn "Multiple testbenches found — pick one:"
+  echo
+  local i=1 tb
+  for tb in "${TB_ENTITIES[@]}"; do
+    printf '   %s%2d)%s  %s%s%s  %s(%s)%s\n' \
+      "$BOLD" "$i" "$RESET" "$CYAN" "$tb" "$RESET" "$DIM" "${ENT_FILE[$tb]:-}" "$RESET"
+    i=$((i + 1))
+  done
+  echo
+  info "Tip: 'mqvhdl run --tb <entity>' (or 'build --tb') skips this menu."
+  echo
+  local choice
+  if ! read -r -p "Select testbench [1-${#TB_ENTITIES[@]}]: " choice; then
+    echo
+    error "No selection made."
+    exit 1
+  fi
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 )) || (( choice > ${#TB_ENTITIES[@]} )); then
+    error "Invalid selection: $choice"
+    exit 1
+  fi
+  SELECTED_TB="${TB_ENTITIES[$((choice - 1))]}"
+  info "Selected: ${BOLD}$SELECTED_TB${RESET}"
 }
 
-check_run_dependencies() {
-    require_command ghdl
-    require_command gtkwave
+# ─────────────────────────────────────────────
+# Cache (.mqvhdl_modules/meta/index)
+#
+# One record per analyzed file:
+#   file|content_sha|flag_signature|deps|dep_hashes_at_build_time
+#
+# A file is reused only if its content, the flag signature, its
+# resolved dependency list AND the current content hashes of all its
+# dependencies all match. That makes invalidation transitive and also
+# catches option changes (std/ieee/...) and GHDL updates.
+# ─────────────────────────────────────────────
+
+declare -A C_SHA C_SIG C_DEPS C_DEPH
+declare -A SHA_NOW
+
+load_cache_index() {
+  unset C_SHA C_SIG C_DEPS C_DEPH
+  declare -gA C_SHA C_SIG C_DEPS C_DEPH
+  if [[ ! -f "$CACHE_INDEX" ]]; then return 0; fi
+  local f sha sig deps deph
+  while IFS='|' read -r f sha sig deps deph; do
+    if [[ -z "$f" || "$f" == "#"* ]]; then continue; fi
+    C_SHA["$f"]="$sha"
+    C_SIG["$f"]="$sig"
+    C_DEPS["$f"]="$deps"
+    C_DEPH["$f"]="$deph"
+  done < "$CACHE_INDEX"
+}
+
+deps_to_index() {
+  if [[ -z "$1" ]]; then printf ''; return 0; fi
+  printf '%s' "$1" | paste -sd, -
+}
+
+dep_hashes_string() {
+  local d out=""
+  while IFS= read -r d; do
+    if [[ -z "$d" ]]; then continue; fi
+    if [[ -n "${SHA_NOW[$d]:-}" ]]; then
+      out+="${SHA_NOW[$d]}"
+    else
+      out+="$(hash_file "$d")"
+    fi
+    out+=","
+  done <<<"$1"
+  printf '%s' "${out%,}"
+}
+
+record_is_valid() {
+  if [[ "${C_SHA[$1]:-}" != "$2" ]]; then return 1; fi
+  if [[ "${C_SIG[$1]:-}" != "$(flags_signature)" ]]; then return 1; fi
+  if [[ "${C_DEPS[$1]:-}" != "$3" ]]; then return 1; fi
+  if [[ "${C_DEPH[$1]:-}" != "$4" ]]; then return 1; fi
+  return 0
+}
+
+store_record() {
+  C_SHA["$1"]="$2"
+  C_SIG["$1"]="$(flags_signature)"
+  C_DEPS["$1"]="$3"
+  C_DEPH["$1"]="$4"
+}
+
+write_cache_index() {
+  mkdir -p "$CACHE_META"
+  local tmp="$CACHE_INDEX.tmp"
+  local f
+  printf '# mqvhdl cache index v1 — do not edit\n' > "$tmp"
+  while IFS= read -r f; do
+    if [[ -z "$f" ]]; then continue; fi
+    printf '%s|%s|%s|%s|%s\n' "$f" "${C_SHA[$f]:-}" "${C_SIG[$f]:-}" "${C_DEPS[$f]:-}" "${C_DEPH[$f]:-}" >> "$tmp"
+  done < <(printf '%s\n' "${!C_SHA[@]}" | LC_ALL=C sort)
+  mv "$tmp" "$CACHE_INDEX"
+}
+
+closure_fingerprint() {
+  local f
+  {
+    while IFS= read -r f; do
+      if [[ -z "$f" ]]; then continue; fi
+      printf '%s:%s\n' "$f" "${SHA_NOW[$f]:-missing}"
+    done < <(printf '%s\n' "${POST_ORDER[@]}" | LC_ALL=C sort)
+  } | hash_stdin
+}
+
+# ─────────────────────────────────────────────
+# Build engine
+# ─────────────────────────────────────────────
+
+ANALYZED_COUNT=0
+CACHED_COUNT=0
+
+analyze_closure() {
+  local total=${#POST_ORDER[@]}
+  if (( total == 0 )); then
+    warn "Nothing to analyze."
+    return 0
+  fi
+  ANALYZED_COUNT=0
+  CACHED_COUNT=0
+  local i=0 file sha deps deph
+  for file in "${POST_ORDER[@]}"; do
+    i=$((i + 1))
+    sha="$(hash_file "$file")"
+    SHA_NOW["$file"]="$sha"
+    deps="${CLOSURE_DEPS[$file]:-}"
+    deph="$(dep_hashes_string "$deps")"
+    if record_is_valid "$file" "$sha" "$(deps_to_index "$deps")" "$deph"; then
+      CACHED_COUNT=$((CACHED_COUNT + 1))
+      printf '%s  [%d/%d] %-10s %s%s\n' "$DIM" "$i" "$total" "cached" "$file" "$RESET"
+    else
+      printf '%s  [%d/%d] %-10s %s%s%s\n' "$BLUE" "$i" "$total" "analyze" "$BOLD" "$file" "$RESET"
+      ghdl -a "${GHDL_FLAGS[@]}" "$file"
+      ANALYZED_COUNT=$((ANALYZED_COUNT + 1))
+      store_record "$file" "$sha" "$(deps_to_index "$deps")" "$deph"
+      write_cache_index     # persist progress even if a later file fails
+    fi
+  done
+  echo
+  if (( ANALYZED_COUNT == 0 )); then
+    success "All ${total} file(s) up to date (cache hit)."
+  else
+    success "Analyzed ${ANALYZED_COUNT}, reused ${CACHED_COUNT} (${total} files)."
+  fi
+}
+
+elaborate_testbench() {
+  local tb="$1"
+  local sig
+  sig="$(closure_fingerprint)|$(flags_signature)"
+  local rec="$CACHE_META/elab_${tb}.rec"
+  local prev_sig="" prev_bin=""
+  if [[ -f "$rec" ]]; then
+    prev_sig="$(sed -n 's/^sig=//p' "$rec" | head -n 1)"
+    prev_bin="$(sed -n 's/^bin=//p' "$rec" | head -n 1)"
+  fi
+  if [[ "$prev_sig" == "$sig" ]]; then
+    if [[ -z "$prev_bin" || -x "$prev_bin" ]]; then
+      ELAB_BIN="$prev_bin"
+      dim "elaboration cached for $tb"
+      return 0
+    fi
+  fi
+
+  info "Elaborating ${BOLD}$tb${RESET}"
+  ghdl -e "${GHDL_FLAGS[@]}" "$tb"
+
+  # Compiled backends (gcc/llvm) produce a binary; mcode does not.
+  local bin=""
+  if [[ -x "$CACHE_GHDL/$tb" ]]; then
+    bin="$CACHE_GHDL/$tb"
+  elif [[ -x "$tb" ]]; then
+    bin="$PWD/$tb"
+  fi
+  if [[ -n "$bin" ]]; then
+    mkdir -p "$BUILD_BIN"
+    if cp -f "$bin" "$BUILD_BIN/$tb" 2>/dev/null; then
+      ELAB_BIN="$BUILD_BIN/$tb"
+    else
+      ELAB_BIN="$bin"
+    fi
+  else
+    ELAB_BIN=""
+  fi
+
+  {
+    printf 'sig=%s\n' "$sig"
+    printf 'bin=%s\n' "$ELAB_BIN"
+  } > "$rec"
+  success "Elaborated $tb"
+}
+
+write_lock_file() {
+  local tmp="$LOCK_FILE.tmp"
+  local f deps_idx
+  {
+    printf '# mqvhdl lock file — generated by mqvhdl %s — do not edit\n' "$VERSION"
+    printf 'lock_format=1\n'
+    printf 'tool_version=%s\n' "$VERSION"
+    printf 'ghdl_version=%s\n' "$GHDL_VERSION"
+    printf 'std=%s\n' "$STD"
+    printf 'ieee=%s\n' "$IEEE"
+    printf 'relaxed=%s\n' "$RELAXED"
+    printf 'fexplicit=%s\n' "$FEXPLICIT"
+    printf 'source_dir=%s\n' "$SOURCE_DIR"
+    printf 'testbench_dir=%s\n' "$TESTBENCH_DIR"
+    printf 'updated=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '\n[files]\n'
+    while IFS= read -r f; do
+      if [[ -z "$f" ]]; then continue; fi
+      deps_idx="$(printf '%s' "${CLOSURE_DEPS[$f]:-}" | paste -sd, -)"
+      printf '%s|%s|%s|%s\n' "$f" "${SHA_NOW[$f]:-${C_SHA[$f]:-}}" "${FILE_DEFS[$f]:-}" "$deps_idx"
+    done < <(printf '%s\n' "${!FILE_DEFS[@]}" | LC_ALL=C sort)
+  } > "$tmp"
+  mv "$tmp" "$LOCK_FILE"
+  dim "lock file updated: $LOCK_FILE"
 }
 
 # ─────────────────────────────────────────────
@@ -136,114 +907,147 @@ check_run_dependencies() {
 # ─────────────────────────────────────────────
 
 init_project() {
-    local source_dir="src"
-    local testbench_dir="tb"
+  local source_dir="src" testbench_dir="tb" std="93"
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -s|--source-dir)
-                [[ -n "${2:-}" ]] || {
-                    error "Missing value for $1"
-                    exit 1
-                }
-                source_dir="$2"
-                shift 2
-                ;;
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--source-dir)
+        if [[ -z "${2:-}" ]]; then error "Missing value for $1"; exit 1; fi
+        source_dir="$2"; shift 2 ;;
+      -t|--testbench-dir)
+        if [[ -z "${2:-}" ]]; then error "Missing value for $1"; exit 1; fi
+        testbench_dir="$2"; shift 2 ;;
+      --std)
+        if [[ -z "${2:-}" ]]; then error "Missing value for $1"; exit 1; fi
+        std="$2"; shift 2 ;;
+      -h|--help) show_init_help; exit 0 ;;
+      *) error "Unknown init option: $1"; exit 1 ;;
+    esac
+  done
 
-            -t|--testbench-dir)
-                [[ -n "${2:-}" ]] || {
-                    error "Missing value for $1"
-                    exit 1
-                }
-                testbench_dir="$2"
-                shift 2
-                ;;
+  if [[ " $VALID_STD " != *" $std "* ]]; then
+    error "Invalid --std value: $std"
+    hint "Valid values: $VALID_STD"
+    exit 1
+  fi
 
-            -h|--help)
-                echo "Usage: mqvhdl init [options]"
-                echo
-                echo "Options:"
-                echo "    -s, --source-dir <dir>       Source directory (default: src)"
-                echo "    -t, --testbench-dir <dir>   Testbench directory (default: tb)"
-                exit 0
-                ;;
+  if [[ -e "$CONFIG_FILE" ]]; then
+    error "$CONFIG_FILE already exists."
+    hint "Edit it to reconfigure, or remove it to re-initialize."
+    exit 1
+  fi
 
-            *)
-                error "Unknown init option: $1"
-                exit 1
-                ;;
-        esac
-    done
+  mkdir -p "$source_dir" "$testbench_dir"
 
-    if [[ -f "$CONFIG_FILE" ]]; then
-        error "$CONFIG_FILE already exists."
-        echo
-        echo "Project is already initialized."
-        exit 1
-    fi
+  cat > "$CONFIG_FILE" <<CONFIG
+# mqvhdl project configuration — see 'mqvhdl help'
 
-    mkdir -p "$source_dir"
-    mkdir -p "$testbench_dir"
-
-    cat > "$CONFIG_FILE" <<CONFIG
+# Directories (relative to the project root)
 source_dir=$source_dir
 testbench_dir=$testbench_dir
+
+# VHDL standard: $VALID_STD
+# Changing this invalidates the whole build cache.
+std=$std
+
+# IEEE library: standard | synopsys
+# 'synopsys' adds --ieee=synopsys (std_logic_arith, std_logic_unsigned, ...)
+ieee=standard
+
+# Relax LRM rules (--relaxed-rules): yes | no
+relaxed=no
+
+# Give priority to explicit component binding (-fexplicit): yes | no
+fexplicit=no
 CONFIG
 
-    success "Project initialized."
-    echo
-    echo "  Configuration : $CONFIG_FILE"
-    echo "  Source        : $source_dir/"
-    echo "  Testbenches   : $testbench_dir/"
+  success "Project initialized."
+  echo
+  printf '  %s\n' "$CONFIG_FILE"
+  printf '  %s/         ← VHDL sources\n' "$source_dir"
+  printf '  %s/         ← testbenches\n' "$testbench_dir"
+  echo
+  info "Cache (${CACHE_DIR}/) and outputs (${BUILD_DIR}/) appear on first build."
+  info "Next: add VHDL files, then run 'mqvhdl build'."
 }
 
 # ─────────────────────────────────────────────
 # list
 # ─────────────────────────────────────────────
 
+show_entity_list() {
+  local found=false
+  local f t defs=""
+  for f in "$@"; do
+    for t in ${FILE_DEFS[$f]:-}; do
+      case "$t" in
+        entity:*)
+          found=true
+          printf '  %s•%s %s%s%s\n' "$GREEN" "$RESET" "$BOLD" "${t#entity:}" "$RESET"
+          printf '      %s%s%s\n' "$DIM" "$f" "$RESET"
+          ;;
+        package:*)  defs+="${t#package:} (package)  " ;;
+        pkgbody:*)  defs+="${t#pkgbody:} (package body)  " ;;
+        config:*)   defs+="${t#config:} (configuration)  " ;;
+        context:*)  defs+="${t#context:} (context)  " ;;
+      esac
+    done
+  done
+  if [[ "$found" == false ]]; then
+    printf '  %s(none found)%s\n' "$DIM" "$RESET"
+  fi
+  if [[ -n "$defs" ]]; then
+    printf '  %sother definitions: %s%s\n' "$DIM" "$defs" "$RESET"
+  fi
+}
+
 list_project() {
-    require_project
-    load_config
+  require_project
+  load_config
+  scan_project
+  collect_tb_entities
 
-    echo
-    echo -e "${CYAN}mqvhdl project${RESET}"
-    echo "────────────────────────────────────────"
-    echo "Source directory     : $SOURCE_DIR/"
-    echo "Testbench directory  : $TESTBENCH_DIR/"
-    echo
-
-    echo -e "${CYAN}Source entities${RESET}"
-    echo "────────────────────────────────────────"
-
-    local source_found=false
-
-    while IFS='|' read -r entity file; do
-        source_found=true
-        echo "  • $entity"
-        echo "    └─ $file"
-    done < <(discover_entities "$SOURCE_DIR")
-
-    if [[ "$source_found" == false ]]; then
-        echo "  (none found)"
+  header "mqvhdl project"
+  info "Sources       : ${SOURCE_DIR}/"
+  info "Testbenches   : ${TESTBENCH_DIR}/"
+  info "Standard      : $(std_display "$STD")"
+  if [[ -d "$CACHE_DIR" ]]; then
+    local n=0
+    if [[ -f "$CACHE_INDEX" ]]; then
+      n="$(grep -c -v -e '^#' -e '^$' "$CACHE_INDEX" || true)"
     fi
+    info "Cache         : ${CACHE_DIR}/ (${n} file(s) cached)"
+  else
+    info "Cache         : (empty — run 'mqvhdl build')"
+  fi
 
+  echo
+  printf '%sSource entities%s\n' "$CYAN$BOLD" "$RESET"
+  show_entity_list "${SOURCE_FILES[@]}"
+
+  echo
+  printf '%sTestbench entities%s\n' "$CYAN$BOLD" "$RESET"
+  show_entity_list "${TB_FILES[@]}"
+
+  if (( ${#TB_ENTITIES[@]} > 0 )); then
     echo
-    echo -e "${CYAN}Testbench entities${RESET}"
-    echo "────────────────────────────────────────"
-
-    local tb_found=false
-
-    while IFS='|' read -r entity file; do
-        tb_found=true
-        echo "  • $entity"
-        echo "    └─ $file"
-    done < <(discover_entities "$TESTBENCH_DIR")
-
-    if [[ "$tb_found" == false ]]; then
-        echo "  (none found)"
-    fi
-
-    echo
+    printf '%sTestbench dependency closures%s\n' "$CYAN$BOLD" "$RESET"
+    local tb f dep_list n
+    for tb in "${TB_ENTITIES[@]}"; do
+      f="${ENT_FILE[$tb]:-}"
+      if [[ -z "$f" ]]; then continue; fi
+      reset_graph
+      visit_file "$f"
+      n=${#POST_ORDER[@]}
+      dep_list="$(printf '%s\n' "${POST_ORDER[@]}" | LC_ALL=C sort | grep -v -x -F "$f" | paste -sd, -)"
+      printf '  %s•%s %s%s%s %s— %d file(s)%s\n' \
+        "$GREEN" "$RESET" "$BOLD" "$tb" "$RESET" "$DIM" "$(( n - 1 ))" "$RESET"
+      if [[ -n "$dep_list" ]]; then
+        printf '      %s%s%s\n' "$DIM" "$dep_list" "$RESET"
+      fi
+    done
+  fi
+  echo
 }
 
 # ─────────────────────────────────────────────
@@ -251,129 +1055,99 @@ list_project() {
 # ─────────────────────────────────────────────
 
 build_project() {
-    require_project
-    check_build_dependencies
-    load_config
+  local analyze_only=false elaborate=false use_all=false testbench=""
 
-    local analyze_only=false
-    local elaborate=false
-    local testbench=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--analyze) analyze_only=true; shift ;;
+      -e|--elaborate) elaborate=true; shift ;;
+      -t|--tb)
+        if [[ -z "${2:-}" ]]; then error "Missing testbench entity for $1"; exit 1; fi
+        testbench="$2"; shift 2 ;;
+      --all) use_all=true; shift ;;
+      -h|--help) show_build_help; exit 0 ;;
+      *) error "Unknown build option: $1"; exit 1 ;;
+    esac
+  done
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -a|--analyze)
-                analyze_only=true
-                shift
-                ;;
+  if [[ "$analyze_only" == true && "$elaborate" == true ]]; then
+    error "--analyze and --elaborate are mutually exclusive."
+    exit 1
+  fi
+  if [[ "$use_all" == true && -n "$testbench" ]]; then
+    error "--all cannot be combined with --tb."
+    exit 1
+  fi
 
-            -e|--elaborate)
-                elaborate=true
-                shift
-                ;;
+  require_project
+  require_command ghdl
+  load_config
+  prepare_build_env
+  build_ghdl_flags
+  acquire_instance_lock
 
-            -t|--tb)
-                [[ -n "${2:-}" ]] || {
-                    error "Missing testbench entity."
-                    exit 1
-                }
-                testbench="$2"
-                shift 2
-                ;;
+  scan_project
+  collect_tb_entities
 
-            -h|--help)
-                echo "Usage: mqvhdl build [options]"
-                echo
-                echo "Options:"
-                echo "    -a, --analyze       Analyze only"
-                echo "    -e, --elaborate    Elaborate a testbench"
-                echo "    -t, --tb <entity>  Testbench entity to elaborate"
-                exit 0
-                ;;
+  header "mqvhdl build"
+  info "Standard      : $(std_display "$STD")"
+  info "Sources       : ${SOURCE_DIR}/"
+  info "Testbenches   : ${TESTBENCH_DIR}/"
 
-            *)
-                error "Unknown build option: $1"
-                exit 1
-                ;;
-        esac
-    done
+  load_cache_index
+  reset_graph
+  SELECTED_TB=""
 
-    if [[ "$analyze_only" == true && "$elaborate" == true ]]; then
-        error "Cannot use --analyze and --elaborate together."
+  if [[ "$use_all" == true ]]; then
+    info "Scope         : all VHDL files (--all)"
+    local f
+    for f in "${SOURCE_FILES[@]}"; do visit_file "$f"; done
+    for f in "${TB_FILES[@]}"; do visit_file "$f"; done
+  else
+    local roots=() tb tb_file
+    if [[ -n "$testbench" ]]; then
+      select_testbench "$testbench"
+      roots=("$SELECTED_TB")
+    elif [[ "$elaborate" == true ]]; then
+      select_testbench ""
+      roots=("$SELECTED_TB")
+    else
+      if (( ${#TB_ENTITIES[@]} == 0 )); then
+        error "No testbench entities found in ${TESTBENCH_DIR}/."
+        hint "mqvhdl builds only what testbenches need."
+        hint "Add a testbench, or use 'mqvhdl build --all' to analyze everything."
         exit 1
+      fi
+      roots=("${TB_ENTITIES[@]}")
     fi
 
-    echo
-    echo -e "${CYAN}Building project${RESET}"
-    echo "────────────────────────────────────────"
-
-    local source_files=()
-    local tb_files=()
-
-    while IFS= read -r -d '' file; do
-        source_files+=("$file")
-    done < <(
-        find "$SOURCE_DIR" -type f \
-            \( -iname "*.vhd" -o -iname "*.vhdl" \) \
-            -print0 | sort -z
-    )
-
-    while IFS= read -r -d '' file; do
-        tb_files+=("$file")
-    done < <(
-        find "$TESTBENCH_DIR" -type f \
-            \( -iname "*.vhd" -o -iname "*.vhdl" \) \
-            -print0 | sort -z
-    )
-
-    if [[ ${#source_files[@]} -eq 0 ]]; then
-        warn "No VHDL source files found in $SOURCE_DIR/"
+    if (( ${#roots[@]} == 1 )); then
+      info "Root          : ${roots[0]}"
+    else
+      info "Roots         : ${#roots[@]} testbenches"
     fi
 
-    if [[ ${#tb_files[@]} -eq 0 ]]; then
-        warn "No VHDL testbench files found in $TESTBENCH_DIR/"
-    fi
-
-    # Analyze source files
-    for file in "${source_files[@]}"; do
-        info "Analyzing source: $file"
-        ghdl -a "$file"
-        success "Source analyzed: $file"
+    for tb in "${roots[@]}"; do
+      tb_file="${ENT_FILE[$tb]:-}"
+      if [[ -z "$tb_file" ]]; then
+        error "Cannot locate file for testbench entity: $tb"
+        exit 1
+      fi
+      visit_file "$tb_file"
     done
+  fi
 
-    # Analyze testbenches
-    for file in "${tb_files[@]}"; do
-        info "Analyzing testbench: $file"
-        ghdl -a "$file"
-        success "Testbench analyzed: $file"
-    done
+  echo
+  info "Dependency closure: ${#POST_ORDER[@]} file(s)"
+  analyze_closure
+  write_lock_file
 
-    if [[ "$analyze_only" == true ]]; then
-        echo
-        success "Analysis complete."
-        return 0
+  if [[ "$elaborate" == true ]]; then
+    if [[ -z "$SELECTED_TB" ]]; then
+      select_testbench ""
     fi
-
-    if [[ "$elaborate" == true ]]; then
-        if [[ -z "$testbench" ]]; then
-            error "--elaborate requires --tb <entity>"
-            exit 1
-        fi
-
-        if ! find_entity_file "$testbench" "$TESTBENCH_DIR" >/dev/null; then
-            error "Testbench entity not found: $testbench"
-            echo
-            echo "Run 'mqvhdl list' to see available testbenches."
-            exit 1
-        fi
-
-        echo
-        info "Elaborating: $testbench"
-        ghdl -e "$testbench"
-        success "Elaboration complete: $testbench"
-    fi
-
-    echo
-    success "Build complete."
+    elaborate_testbench "$SELECTED_TB"
+  fi
 }
 
 # ─────────────────────────────────────────────
@@ -381,123 +1155,99 @@ build_project() {
 # ─────────────────────────────────────────────
 
 run_simulation() {
-    require_project
-    check_run_dependencies
-    load_config
+  local testbench="" output="" generate_wave=true
 
-    local testbench=""
-    local output=""
-    local generate_wave=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--tb)
+        if [[ -z "${2:-}" ]]; then error "Missing testbench entity for $1"; exit 1; fi
+        testbench="$2"; shift 2 ;;
+      -o|--output)
+        if [[ -z "${2:-}" ]]; then error "Missing waveform name for $1"; exit 1; fi
+        output="$2"; shift 2 ;;
+      -g|--ghw) generate_wave=true; shift ;;
+      --no-wave) generate_wave=false; shift ;;
+      -h|--help) show_run_help; exit 0 ;;
+      *) error "Unknown run option: $1"; exit 1 ;;
+    esac
+  done
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -t|--tb)
-                [[ -n "${2:-}" ]] || {
-                    error "Missing testbench entity."
-                    exit 1
-                }
-                testbench="$2"
-                shift 2
-                ;;
+  require_project
+  require_command ghdl
+  load_config
+  if [[ "$generate_wave" == true ]]; then
+    require_command gtkwave
+  fi
+  prepare_build_env
+  build_ghdl_flags
+  acquire_instance_lock
 
-            -o|--output)
-                [[ -n "${2:-}" ]] || {
-                    error "Missing waveform name."
-                    exit 1
-                }
-                output="$2"
-                shift 2
-                ;;
+  scan_project
+  collect_tb_entities
 
-            -g|--ghw)
-                generate_wave=true
-                shift
-                ;;
+  header "mqvhdl run"
+  select_testbench "$testbench"
 
-            --no-wave)
-                generate_wave=false
-                shift
-                ;;
+  info "Standard      : $(std_display "$STD")"
+  load_cache_index
+  reset_graph
 
-            -h|--help)
-                echo "Usage: mqvhdl run --tb <entity> [options]"
-                echo
-                echo "Options:"
-                echo "    -t, --tb <entity>  Testbench entity"
-                echo "    -o, --output <name> Waveform name"
-                echo "    -g, --ghw          Generate GHW waveform"
-                echo "    --no-wave          Do not generate waveform"
-                exit 0
-                ;;
+  local tb_file
+  tb_file="${ENT_FILE[$SELECTED_TB]:-}"
+  if [[ -z "$tb_file" ]]; then
+    error "Cannot locate file for testbench entity: $SELECTED_TB"
+    exit 1
+  fi
+  visit_file "$tb_file"
 
-            *)
-                error "Unknown run option: $1"
-                exit 1
-                ;;
-        esac
-    done
+  local n_deps=$(( ${#POST_ORDER[@]} - 1 ))
+  if (( n_deps < 0 )); then n_deps=0; fi
+  info "Dependencies  : ${n_deps} file(s)"
+  echo
 
-    if [[ -z "$testbench" ]]; then
-        local testbenches=()
+  analyze_closure
+  write_lock_file
+  elaborate_testbench "$SELECTED_TB"
 
-        while IFS='|' read -r entity file; do
-            testbenches+=("$entity")
-        done < <(discover_entities "$TESTBENCH_DIR")
-
-        if [[ ${#testbenches[@]} -eq 0 ]]; then
-            error "No testbench entities found."
-            exit 1
-        elif [[ ${#testbenches[@]} -eq 1 ]]; then
-            testbench="${testbenches[0]}"
-            info "Using testbench: $testbench"
-        else
-            error "Multiple testbenches found. Specify one with --tb."
-            echo
-            echo "Available testbenches:"
-            for tb in "${testbenches[@]}"; do
-                echo "  • $tb"
-            done
-            exit 1
-        fi
+  local wavefile=""
+  if [[ "$generate_wave" == true ]]; then
+    local name="$SELECTED_TB"
+    if [[ -n "$output" ]]; then
+      name="$(basename -- "$output")"
+      name="${name%.ghw}"
     fi
+    mkdir -p "$BUILD_WAVE"
+    wavefile="$BUILD_WAVE/${name}.ghw"
+  fi
 
-    if ! find_entity_file "$testbench" "$TESTBENCH_DIR" >/dev/null; then
-        error "Testbench entity not found: $testbench"
-        echo
-        echo "Run 'mqvhdl list' to see available testbenches."
-        exit 1
-    fi
+  local -a run_opts=()
+  if [[ -n "$wavefile" ]]; then
+    run_opts+=(--wave="$wavefile")
+  fi
 
-    # Build before simulation
-    build_project
+  echo
+  info "Running simulation: ${BOLD}$SELECTED_TB${RESET}"
+  if [[ -n "$ELAB_BIN" && -x "$ELAB_BIN" ]]; then
+    "$ELAB_BIN" "${run_opts[@]}"
+  else
+    ghdl -r "${GHDL_FLAGS[@]}" "$SELECTED_TB" "${run_opts[@]}"
+  fi
 
+  if [[ -n "$wavefile" ]]; then
     echo
-    info "Elaborating: $testbench"
-    ghdl -e "$testbench"
-    success "Elaboration complete."
-
-    echo
-    info "Running simulation: $testbench"
-
-    if [[ "$generate_wave" == true ]]; then
-        if [[ -z "$output" ]]; then
-            output="$testbench"
-        fi
-
-        local waveform="${output}.ghw"
-
-        ghdl -r "$testbench" --wave="$waveform"
-
-        success "Waveform generated: $waveform"
-
-        echo
-        info "Opening GTKWave"
-        gtkwave "$waveform" >/dev/null 2>&1 &
-        success "GTKWave started."
+    success "Waveform: ${BOLD}$wavefile${RESET}"
+    if [[ -z "${DISPLAY:-}" ]]; then
+      warn "DISPLAY is not set — skipping GTKWave launch."
     else
-        ghdl -r "$testbench"
-        success "Simulation complete."
+      info "Opening GTKWave..."
+      gtkwave "$wavefile" >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+      success "GTKWave started."
     fi
+  else
+    echo
+    success "Simulation complete."
+  fi
 }
 
 # ─────────────────────────────────────────────
@@ -505,114 +1255,178 @@ run_simulation() {
 # ─────────────────────────────────────────────
 
 clean_project() {
-    info "Removing generated files..."
+  header "mqvhdl clean"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    warn "No $CONFIG_FILE in current directory — cleaning here anyway."
+  fi
 
-    find . -type f \
-        \( -name "*.cf" \
-        -o -name "*.ghw" \
-        -o -name "*.vcd" \
-        -o -name "*.gtkw" \) \
-        -delete
+  if [[ -d "$CACHE_DIR" ]]; then rm -rf "$CACHE_DIR"; success "Removed cache:   $CACHE_DIR/"; fi
+  if [[ -d "$BUILD_DIR" ]]; then rm -rf "$BUILD_DIR"; success "Removed outputs: $BUILD_DIR/"; fi
+  if [[ -f "$LOCK_FILE" ]]; then rm -f "$LOCK_FILE"; success "Removed lock:    $LOCK_FILE"; fi
 
-    success "Clean complete."
+  local f removed=0
+  while IFS= read -r f; do
+    if [[ -z "$f" ]]; then continue; fi
+    rm -f "$f"
+    removed=$((removed + 1))
+    dim "removed stray: $f"
+  done < <(find . \( -name .git -o -name "$CACHE_DIR" -o -name "$BUILD_DIR" \) -prune -o \
+             -type f \( -name '*.cf' -o -name '*.o' -o -name '*.ghw' \
+             -o -name '*.vcd' -o -name '*.fst' -o -name '*.gtkw' \) -print 2>/dev/null)
+
+  if (( removed == 0 )) && [[ ! -d "$CACHE_DIR" && ! -d "$BUILD_DIR" && ! -f "$LOCK_FILE" ]]; then
+    info "Nothing to clean."
+  fi
+  success "Clean complete."
 }
 
 # ─────────────────────────────────────────────
 # help
 # ─────────────────────────────────────────────
 
-show_help() {
-    cat <<HELP
-mqvhdl ${VERSION}
+show_version() { printf 'mqvhdl %s\n' "$VERSION"; }
 
-A small VHDL project workflow tool built around GHDL and GTKWave.
+show_init_help() {
+  cat <<'HELP'
+Usage: mqvhdl init [options]
 
-Usage:
-    mqvhdl <command> [options]
-
-Commands:
-    init        Initialize a VHDL project
-    build       Analyze and optionally elaborate the project
-    run         Run a testbench simulation
-    list        List discovered entities and testbenches
-    clean       Remove generated files
-    help        Show this help message
-
-Examples:
-    mqvhdl init
-
-    mqvhdl init -s rtl -t verification
-
-    mqvhdl list
-
-    mqvhdl build
-
-    mqvhdl build --analyze
-
-    mqvhdl build --elaborate --tb and_gate_tb
-
-    mqvhdl run --tb and_gate_tb
-
-    mqvhdl run --tb and_gate_tb --output and_gate
-
-    mqvhdl clean
-
-Version:
-    mqvhdl ${VERSION}
+Options:
+  -s, --source-dir <dir>       Source directory (default: src)
+  -t, --testbench-dir <dir>    Testbench directory (default: tb)
+      --std <87|93|00|02|08|19>  VHDL standard (default: 93)
+  -h, --help                   Show this help
 HELP
 }
 
-show_version() {
-    echo "mqvhdl ${VERSION}"
+show_build_help() {
+  cat <<'HELP'
+Usage: mqvhdl build [options]
+
+Analyzes only the files needed by the selected testbench(es), in dependency
+order, reusing every file that is still valid in the cache.
+
+Options:
+  -t, --tb <entity>   Build only the closure of this testbench
+  -e, --elaborate     Also elaborate the selected testbench
+  -a, --analyze       Analyze only (default behavior)
+      --all           Analyze every VHDL file in both directories
+  -h, --help          Show this help
+
+Notes:
+  * Without --tb, every testbench in the testbench directory is a root.
+  * A file is re-analyzed only when its content, one of its dependencies,
+    the GHDL version or the configured analysis options (std/ieee/...)
+    change.
+HELP
+}
+
+show_run_help() {
+  cat <<'HELP'
+Usage: mqvhdl run [options]
+
+Options:
+  -t, --tb <entity>    Testbench entity to run
+  -o, --output <name>  Waveform name (default: <testbench>)
+      --no-wave        No waveform, no GTKWave
+  -g, --ghw            Generate a GHW waveform (default)
+  -h, --help           Show this help
+
+Notes:
+  * With a single testbench it is selected automatically.
+  * With several testbenches an interactive menu is shown (or use --tb).
+  * The waveform is written to build/wave/<name>.ghw.
+HELP
+}
+
+show_help() {
+  cat <<HELP
+mqvhdl ${VERSION} — a lightweight VHDL project workflow tool (GHDL + GTKWave)
+
+Usage:
+  mqvhdl <command> [options]
+
+Commands:
+  init        Initialize a new project
+  list        Show configuration, entities and testbench dependency closures
+  build       Dependency-ordered, cached analyze (+ optional elaborate)
+  run         Build (cached) and simulate a testbench, then open GTKWave
+  clean       Remove the cache, build outputs and the lock file
+  help        Show this help
+
+Project files:
+  ${CONFIG_FILE}             Project configuration ('#' comments allowed)
+  ${LOCK_FILE}       Generated lock file: state of the last successful build
+  ${CACHE_DIR}/     Cache: meta/ (per-file cache), ghdl/ (GHDL libraries)
+  ${BUILD_DIR}/              Outputs: wave/ (waveforms), bin/ (elaborated binaries)
+
+Configuration keys (.mqvhdl):
+  source_dir=src      Where design sources live
+  testbench_dir=tb    Where testbenches live
+  std=93              VHDL standard — changing it rebuilds everything
+  ieee=standard       standard | synopsys  (--ieee=...)
+  relaxed=no          yes adds --relaxed-rules
+  fexplicit=no        yes adds -fexplicit
+
+How builds work:
+  * mqvhdl parses entities, packages, configurations, contexts,
+    architectures and instantiations to build a dependency graph.
+  * Only the files needed by the selected testbench(es) are analyzed,
+    in dependency order (chained dependencies are handled).
+  * A file is re-analyzed only when its content, one of its dependencies,
+    the GHDL version or the analysis options change — everything else is
+    reused from the cache.
+
+Run 'mqvhdl <command> --help' for command options.
+
+Examples:
+  mqvhdl init
+  mqvhdl init -s rtl -t verification --std 08
+  mqvhdl list
+  mqvhdl build
+  mqvhdl build --tb and_gate_tb
+  mqvhdl build --elaborate --tb and_gate_tb
+  mqvhdl run
+  mqvhdl run --tb and_gate_tb --output and_gate
+  mqvhdl clean
+
+Version:
+  mqvhdl ${VERSION}
+HELP
 }
 
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 
-case "${1:-}" in
+on_exit() {
+  local code=$?
+  release_instance_lock
+  finish_timer "$code"
+}
 
-    init)
-        shift
-        init_project "$@"
-        ;;
+main() {
+  require_bash
+  setup_hash
+  trap on_exit EXIT
 
-    build)
-        shift
-        build_project "$@"
-        ;;
+  local cmd="${1:-}"
+  if [[ $# -gt 0 ]]; then shift; fi
 
-    run)
-        shift
-        run_simulation "$@"
-        ;;
-
-    list)
-        shift
-        list_project "$@"
-        ;;
-
-    clean)
-        shift
-        clean_project "$@"
-        ;;
-
-    help|-h|--help)
-        show_help
-        ;;
-
-    --version|-v)
-        show_version
-        ;;
-
-    "")
-        show_help
-        ;;
-
+  case "$cmd" in
+    init)   COMMAND_NAME="init";  start_timer; init_project "$@" ;;
+    list)   COMMAND_NAME="list";  start_timer; list_project "$@" ;;
+    build)  COMMAND_NAME="build"; start_timer; build_project "$@" ;;
+    run)    COMMAND_NAME="run";   start_timer; run_simulation "$@" ;;
+    clean)  COMMAND_NAME="clean"; start_timer; clean_project "$@" ;;
+    help|-h|--help) show_help ;;
+    --version|-v) show_version ;;
+    "") show_help ;;
     *)
-        error "Unknown command: $1"
-        echo "Use 'mqvhdl help'."
-        exit 1
-        ;;
+      error "Unknown command: $cmd"
+      hint "Run 'mqvhdl help' to list commands."
+      exit 1
+      ;;
+  esac
+}
 
-esac
+main "$@"

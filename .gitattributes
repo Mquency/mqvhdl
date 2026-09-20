@@ -1,0 +1,5 @@
+# Shell scripts must always keep LF — a CRLF shebang = "bad interpreter"
+mqvhdl    text eol=lf
+*.sh      text eol=lf
+*.md      text
+*.vhd     text

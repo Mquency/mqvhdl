@@ -1,0 +1,20 @@
+# Maintainer: mquency <https://github.com/mquency>
+pkgname=mqvhdl
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Lightweight VHDL project workflow tool built around GHDL and GTKWave"
+arch=('any')
+url="https://github.com/mquency/mqvhdl"
+license=('MIT')
+depends=('bash>=4.2' 'ghdl' 'gtkwave')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Replace SKIP with the real hash:
+#   curl -sL "$url/archive/refs/tags/v$pkgver.tar.gz" | sha256sum
+sha256sums=('SKIP')
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 mqvhdl    "$pkgdir/usr/bin/mqvhdl"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE   "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,13 +1,31 @@
-# GHDL build artifacts
-*.cf
+# ─── mqvhdl (v0.3.0) ─────────────────────────
 
-# Waveforms
+# Build cache (GHDL work library + cache metadata)
+.mqvhdl_modules/
+
+# Generated outputs (waveforms, elaborated binaries)
+build/
+
+# mqvhdl lock file (regenerated after every build)
+mqvhdl.lock
+
+# ─── GHDL artifacts ──────────────────────────
+
+# Library/analysis files (incl. strays outside the cache)
+*.cf
+*.o
+
+# ─── Waveforms ───────────────────────────────
+
 *.ghw
 *.vcd
+*.fst
 
-# GTKWave
+# ─── GTKWave ─────────────────────────────────
+
 *.gtkw
 
-# Temporary files
+# ─── Temporary files ─────────────────────────
+
 *.tmp
 *.log
